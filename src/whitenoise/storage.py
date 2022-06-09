@@ -14,6 +14,7 @@ from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
 from django.contrib.staticfiles.storage import StaticFilesStorage
 
 from whitenoise.compress import Compressor
+from whitenoise.compress import compress_in_parallel
 
 _PostProcessT = Iterator[Union[Tuple[str, str, bool], Tuple[str, None, RuntimeError]]]
 
@@ -31,14 +32,11 @@ class CompressedStaticFilesStorage(StaticFilesStorage):
 
         extensions = getattr(settings, "WHITENOISE_SKIP_COMPRESS_EXTENSIONS", None)
         compressor = self.create_compressor(extensions=extensions, quiet=True)
-
-        for path in paths:
-            if compressor.should_compress(path):
-                full_path = self.path(path)
-                prefix_len = len(full_path) - len(path)
-                for compressed_path in compressor.compress(full_path):
-                    compressed_name = compressed_path[prefix_len:]
-                    yield path, compressed_name, True
+        yield from compress_in_parallel(
+            compressor=compressor,
+            get_path=self.path,
+            names=list(paths),
+        )
 
     def create_compressor(self, **kwargs: Any) -> Compressor:
         return Compressor(**kwargs)
@@ -98,8 +96,7 @@ class CompressedManifestStaticFilesStorage(ManifestStaticFilesStorage):
             files_to_delete = set()
             files_to_compress = original_files | hashed_files
         self.delete_files(files_to_delete)
-        for name, compressed_name in self.compress_files(files_to_compress):
-            yield name, compressed_name, True
+        yield from self.compress_files(files_to_compress)
 
     def hashed_name(self, *args, **kwargs):
         name = super().hashed_name(*args, **kwargs)
@@ -131,13 +128,11 @@ class CompressedManifestStaticFilesStorage(ManifestStaticFilesStorage):
     def compress_files(self, names):
         extensions = getattr(settings, "WHITENOISE_SKIP_COMPRESS_EXTENSIONS", None)
         compressor = self.create_compressor(extensions=extensions, quiet=True)
-        for name in names:
-            if compressor.should_compress(name):
-                path = self.path(name)
-                prefix_len = len(path) - len(name)
-                for compressed_path in compressor.compress(path):
-                    compressed_name = compressed_path[prefix_len:]
-                    yield name, compressed_name
+        yield from compress_in_parallel(
+            compressor=compressor,
+            get_path=self.path,
+            names=names,
+        )
 
     def make_helpful_exception(self, exception, name):
         """

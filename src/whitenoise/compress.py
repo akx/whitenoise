@@ -4,7 +4,11 @@ import argparse
 import gzip
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from io import BytesIO
+from typing import Callable
+from typing import Iterable
 
 try:
     import brotli
@@ -134,6 +138,63 @@ class Compressor:
         return filename
 
 
+def get_worker_count() -> int:
+    """
+    Parse WHITENOISE_COMPRESS_WORKER_COUNT and return a number of threads.
+    """
+    try:
+        from django.conf import settings
+
+        mp_setting = getattr(settings, "WHITENOISE_COMPRESS_WORKER_COUNT", None)
+    except ImportError:
+        mp_setting = None
+
+    if not mp_setting:  # Not set or zero
+        return 1
+    if mp_setting == "auto":
+        from multiprocessing import cpu_count
+
+        return cpu_count()
+    try:
+        num_threads = int(mp_setting)
+        if num_threads < 0:
+            num_threads = 1
+        return num_threads
+    except ValueError:
+        return 1
+
+
+def _process_item(name: str, *, get_path, compressor):
+    path = get_path(name)
+    prefix_len = len(path) - len(name)
+    return [
+        (name, (compressed_path[prefix_len:]), True)
+        for compressed_path in compressor.compress(path)
+    ]
+
+
+def compress_in_parallel(
+    compressor: Compressor,
+    get_path: Callable[[str], str],
+    names: list[str],
+) -> Iterable[tuple[str, str, bool]]:
+    num_threads = get_worker_count()
+
+    names_to_compress = [name for name in names if compressor.should_compress(name)]
+
+    if num_threads <= 1:  # No multiprocessing requested?
+        for name in names_to_compress:
+            yield from _process_item(name, get_path=get_path, compressor=compressor)
+        return
+
+    with ThreadPoolExecutor(num_threads) as executor:
+        partial_process_item = partial(
+            _process_item, get_path=get_path, compressor=compressor
+        )
+        for res in executor.map(partial_process_item, names_to_compress):
+            yield from res
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Search for all files inside <root> *not* matching "
@@ -175,12 +236,15 @@ def main(argv=None):
         use_brotli=args.use_brotli,
         quiet=args.quiet,
     )
+
+    paths = []
     for dirpath, _dirs, files in os.walk(args.root):
         for filename in files:
             if compressor.should_compress(filename):
-                path = os.path.join(dirpath, filename)
-                for _compressed in compressor.compress(path):
-                    pass
+                paths.append(os.path.join(dirpath, filename))
+
+    for _ in compress_in_parallel(compressor, os.path.abspath, paths):
+        pass
 
     return 0
 
